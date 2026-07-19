@@ -12,7 +12,9 @@ of erroring.
 Privacy: the table stores enum tokens and numbers only — no prompt text
 (V017 contract, test-enforced) — so every value surfaced here is already
 operator-safe and, unlike ``meta.runs.list``, read-only principals need no
-per-session gating. These handlers observe routing; they never change it.
+per-session gating. The list and get surfaces observe routing without changing
+it. ``router.feedback.submit`` is the one handler that writes: its rating folds
+into the user profile ranking reads on the next turn — see its docstring.
 """
 
 from __future__ import annotations
@@ -123,8 +125,12 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
     returns ``accepted: false`` rather than an error — clients surface it as
     "this message's routing record expired".
 
-    The rating never mutates the ``router_decisions`` table or routing state;
-    consumption happens offline at dataset-build time.
+    The rating never mutates the ``router_decisions`` table, and the trainer
+    still consumes the sidecar offline at dataset-build time. It also rides one
+    slower live path: the thumb is transcribed into a routing-preference memory
+    line, Dream consolidates it into MEMORY.md, and ranking projects that back
+    into the global user profile on a later dynamic-routing turn — so a thumb
+    here shifts ``S_user`` there, once consolidation has run.
     """
     p = params if isinstance(params, dict) else {}
     decision_id = sanitize_token(p.get("decisionId") or p.get("decision_id"))
@@ -167,10 +173,16 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
         else None
     )
 
+    from opensquilla.agents.scope import resolve_agent_workspace_dir
     from opensquilla.session.keys import parse_agent_id
     from opensquilla.squilla_router.self_learning.feedback import write_feedback
+    from opensquilla.squilla_router.self_learning.preference_projection import (
+        ROUTING_PREF_FILENAME,
+        transcribe_thumb,
+    )
 
     agent_id = parse_agent_id(session_key)
+    rated_model = str(record.get("model") or "") or None
     router_cfg = getattr(ctx.config, "squilla_router", None)
     sl_cfg = getattr(router_cfg, "self_learning", None)
     try:
@@ -186,9 +198,35 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
             turn_index=turn_index,
             rating=rating,
             executed_kind=executed_kind,
+            model=rated_model,
             decision_ts=decision_ts,
             retention_days=retention_days,
         )
+        # Transcribe the thumb into a routing-preference memory line, then let
+        # go: Dream consolidates memory/*.md into MEMORY.md on its own cadence,
+        # and _resolve_user_profile projects the consolidated lines back into
+        # history on a later turn. The note lands in the GLOBAL "main"
+        # workspace — the profile is global, so a thumb on any agent's decision
+        # shapes the one profile ranking reads — resolved the same way Dream
+        # resolves the workspace it scans (``resolve_agent_workspace_dir``).
+        line = transcribe_thumb(rated_model, rating)
+        if line is None:
+            # neutral revokes and an unresolvable model cannot be credited;
+            # either way there is nothing durable to append. The feedback row
+            # above still lands for the offline trainer.
+            return
+        try:
+            workspace = resolve_agent_workspace_dir("main", getattr(ctx, "config", None))
+            note = workspace / "memory" / ROUTING_PREF_FILENAME
+            note.parent.mkdir(parents=True, exist_ok=True)
+            with note.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception as exc:  # noqa: BLE001 — a memory-write miss must not lose the rating
+            log.warning(
+                "router_feedback.preference_memory_write_failed",
+                decision_id=decision_id,
+                error=str(exc),
+            )
 
     try:
         await anyio.to_thread.run_sync(_write)

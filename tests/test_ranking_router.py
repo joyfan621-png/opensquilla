@@ -851,11 +851,12 @@ async def test_task_analyzer_uses_provider_interface_and_validates_json() -> Non
     analyzer_payload = json.loads(str(provider.calls[0][0][0].content))
     assert analyzer_payload["allowed_constraints"]["risk"] == ["low", "medium", "high"]
     assert analyzer_payload["allowed_session_intents"] == ["new_task", "continue", "redo"]
-    assert "user_profile" in analyzer_payload
+    # The profile never reaches the analyzer provider, even when one is supplied.
+    assert "user_profile" not in analyzer_payload
 
 
 @pytest.mark.asyncio
-async def test_task_analyzer_omits_disabled_user_profile_and_correlates_logs() -> None:
+async def test_task_analyzer_omits_user_profile_and_correlates_logs() -> None:
     provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
 
     with structlog.testing.capture_logs() as captured:
@@ -886,6 +887,31 @@ async def test_task_analyzer_omits_disabled_user_profile_and_correlates_logs() -
         for row in analyzer_events
     )
     assert all(row["user_profile_enabled"] is False for row in analyzer_events)
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_logs_supplied_profile_without_sending_it() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+
+    with structlog.testing.capture_logs() as captured:
+        await analyze_task_with_provider(
+            provider=provider,
+            message="implement a parser",
+            user_profile=mock_user_profile(),
+            request_context=_context(),
+            routed_tier="c1",
+            routing_confidence=0.8,
+            decision_id="decision-with-profile",
+        )
+
+    assert "user_profile" not in json.loads(str(provider.calls[0][0][0].content))
+    analyzer_events = [
+        row
+        for row in captured
+        if str(row["event"]).startswith("llm_ensemble.router_dynamic.task_analyzer_")
+    ]
+    assert analyzer_events
+    assert all(row["user_profile_enabled"] is True for row in analyzer_events)
 
 
 @pytest.mark.asyncio
@@ -1046,6 +1072,60 @@ def test_hard_filter_records_availability_permission_modality_and_context_reason
     assert "modality_mismatch" in by_model["text-only"]["reasons"]
     assert "context_exceeded" in by_model["short-context"]["reasons"]
     assert decision.proposers[0].model_id == "eligible"
+
+
+def _profile_with_history(*, positive: list[str], negative: list[str], count: int) -> dict:
+    profile = mock_user_profile()
+    profile["history"]["positive_model_ids"] = positive
+    profile["history"]["negative_model_ids"] = negative
+    profile["history"]["feedback_count"] = count
+    return profile
+
+
+def test_history_reorders_candidates_that_task_match_alone_would_not() -> None:
+    """The regression that matters: history must be able to change the order.
+
+    With an empty history every model gets the same neutral S_user, so the
+    0.15 * S_user term is a uniform offset and cannot reorder anything — the
+    profile is inert rather than approximate. A saturated history splits
+    S_user across models and the weaker-but-liked model wins.
+    """
+    liked = _model("liked", capability=0.80, aggregator_fit=0.80)
+    disliked = _model("disliked", capability=0.85, aggregator_fit=0.85)
+
+    neutral = _decision(liked, disliked, analysis=_analysis(tier=2))
+    assert [m.model_id for m in neutral.proposers][0] == "disliked"
+
+    opinionated = _decision(
+        liked,
+        disliked,
+        analysis=_analysis(tier=2),
+        user_profile=_profile_with_history(
+            positive=["liked"], negative=["disliked"], count=20
+        ),
+    )
+    assert [m.model_id for m in opinionated.proposers][0] == "liked"
+
+
+def test_history_confidence_ramps_in_with_feedback_count() -> None:
+    """One click must not swing the ranking to an extreme.
+
+    confidence = min(1, feedback_count / 20), so a single rating moves S_user
+    by 1/20th of the full signal — not enough to overturn a task-match gap
+    that a saturated history does overturn.
+    """
+    liked = _model("liked", capability=0.80, aggregator_fit=0.80)
+    disliked = _model("disliked", capability=0.85, aggregator_fit=0.85)
+
+    barely = _decision(
+        liked,
+        disliked,
+        analysis=_analysis(tier=2),
+        user_profile=_profile_with_history(
+            positive=["liked"], negative=["disliked"], count=1
+        ),
+    )
+    assert [m.model_id for m in barely.proposers][0] == "disliked"
 
 
 def test_ranking_without_user_profile_bypasses_all_profile_effects() -> None:

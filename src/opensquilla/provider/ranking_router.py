@@ -458,16 +458,13 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         ("mock_user_profile", "permission"): {
             "allow_models",
             "deny_models",
-            "allow_tools",
             "risk_allowlist",
         },
         ("mock_user_profile", "preference"): {
             "quality_latency_tradeoff",
             "cost_sensitivity",
-            "preferred_formats",
         },
         ("mock_user_profile", "history"): {
-            "capability_prior",
             "positive_model_ids",
             "negative_model_ids",
             "feedback_count",
@@ -525,7 +522,6 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
             "neutral_score",
             "history_signal_weight",
             "feedback_saturation_count",
-            "preferred_format_bonus",
         },
         ("quality",): {"task_match_weight", "user_score_weight"},
         ("penalties",): {
@@ -849,7 +845,7 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
             "router_dynamic fallback_task_profile.session_intent.type is invalid"
         )
 
-    for key in ("allow_models", "deny_models", "allow_tools"):
+    for key in ("allow_models", "deny_models"):
         _ranking_string_list(config, "mock_user_profile", "permission", key)
     if not _ranking_string_set(
         config, "mock_user_profile", "permission", "risk_allowlist"
@@ -873,35 +869,6 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         raise DynamicRankingError(
             "router_dynamic mock_user_profile.preference.cost_sensitivity is invalid"
         )
-    if not set(
-        _ranking_string_list(
-            config, "mock_user_profile", "preference", "preferred_formats"
-        )
-    ).issubset(set(FORMATS)):
-        raise DynamicRankingError(
-            "router_dynamic mock_user_profile.preference.preferred_formats is invalid"
-        )
-
-    capability_prior = _ranking_mapping(
-        config, "mock_user_profile", "history", "capability_prior"
-    )
-    if not set(capability_prior).issubset(set(CAPABILITIES)):
-        raise DynamicRankingError(
-            "router_dynamic mock_user_profile.history.capability_prior is invalid"
-        )
-    for capability in capability_prior:
-        prior = _ranking_number(
-            config,
-            "mock_user_profile",
-            "history",
-            "capability_prior",
-            str(capability),
-        )
-        if not 0.0 <= prior <= 1.0:
-            raise DynamicRankingError(
-                "router_dynamic mock_user_profile.history.capability_prior values "
-                "must be between 0 and 1"
-            )
     _ranking_string_list(config, "mock_user_profile", "history", "positive_model_ids")
     _ranking_string_list(config, "mock_user_profile", "history", "negative_model_ids")
     if _ranking_int(config, "mock_user_profile", "history", "feedback_count") < 0:
@@ -1012,7 +979,6 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         ("task_match", "missing_role_fit_default"),
         ("user_score", "neutral_score"),
         ("user_score", "history_signal_weight"),
-        ("user_score", "preferred_format_bonus"),
         ("session", "intent_confidence_threshold"),
         ("session", "default_quality_feedback"),
         ("session", "score_delta"),
@@ -1453,6 +1419,84 @@ def mock_user_profile(
 
     effective_config = _resolve_ranking_config(ranking_config)
     return copy.deepcopy(dict(_ranking_mapping(effective_config, "mock_user_profile")))
+
+
+def validate_user_profile(
+    profile: Mapping[str, Any],
+    ranking_config: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Reasons a stored profile cannot be trusted; empty when it is fine.
+
+    ``profile.json`` is hand-editable and is the *only* configuration surface
+    for ``deny_models``. A typo there must be rejected rather than silently
+    ignored: ``_cost_latency_weights`` falls back to a default on an unknown
+    ``cost_sensitivity``, so an invalid edit would route exactly as if it had
+    never been made, and say nothing.
+
+    This lives here rather than in ``profile.py`` because the vocabularies are
+    defined here, and ``self_learning`` must not import from ``provider``.
+    Reading them from the same ranking config as the mock validator
+    (``_validate_ranking_config``) is what stops the two from drifting apart —
+    a shared source rather than two lists that agree today.
+
+    Only keys the file actually carries are checked; a partial profile is
+    normal, and the seam fills the rest from the mock baseline.
+    """
+
+    effective = _resolve_ranking_config(ranking_config)
+    errors: list[str] = []
+
+    permission = profile.get("permission")
+    if isinstance(permission, Mapping):
+        risk_values = _ranking_string_set(
+            effective, "task_profile_schema", "constraint_values", "risk"
+        )
+        allowlist = permission.get("risk_allowlist")
+        if allowlist is not None:
+            if not isinstance(allowlist, list) or not all(
+                isinstance(v, str) for v in allowlist
+            ):
+                errors.append("permission.risk_allowlist must be a list of strings")
+            elif not set(allowlist).issubset(risk_values):
+                unknown = sorted(set(allowlist) - risk_values)
+                errors.append(f"permission.risk_allowlist has unknown values: {unknown}")
+        for key in ("allow_models", "deny_models"):
+            value = permission.get(key)
+            if value is not None and (
+                not isinstance(value, list) or not all(isinstance(v, str) for v in value)
+            ):
+                errors.append(f"permission.{key} must be a list of strings")
+
+    preference = profile.get("preference")
+    if isinstance(preference, Mapping):
+        tradeoff = preference.get("quality_latency_tradeoff")
+        if tradeoff is not None and tradeoff not in _USER_TRADEOFFS:
+            errors.append(
+                f"preference.quality_latency_tradeoff {tradeoff!r} is not one of "
+                f"{sorted(_USER_TRADEOFFS)}"
+            )
+        sensitivity = preference.get("cost_sensitivity")
+        if sensitivity is not None:
+            known = _ranking_mapping(effective, "penalties", "user_cost_sensitivity_weights")
+            if sensitivity not in known:
+                errors.append(
+                    f"preference.cost_sensitivity {sensitivity!r} is not one of "
+                    f"{sorted(known)}"
+                )
+
+    history = profile.get("history")
+    if isinstance(history, Mapping):
+        for key in ("positive_model_ids", "negative_model_ids"):
+            value = history.get(key)
+            if value is not None and (
+                not isinstance(value, list) or not all(isinstance(v, str) for v in value)
+            ):
+                errors.append(f"history.{key} must be a list of strings")
+        count = history.get("feedback_count")
+        if count is not None and (not isinstance(count, int) or count < 0):
+            errors.append("history.feedback_count must be a non-negative integer")
+
+    return errors
 
 
 def build_request_context(
@@ -2066,8 +2110,6 @@ async def analyze_task_with_provider(
         ),
         "request_context": request_context,
     }
-    if user_profile is not None:
-        analyzer_input["user_profile"] = user_profile
     log.info(
         "llm_ensemble.router_dynamic.task_analyzer_started",
         decision_id=decision_id,
@@ -3021,7 +3063,6 @@ def _task_match(
 def _user_score(
     model: RankedModel,
     user_profile: Mapping[str, Any],
-    task_profile: Mapping[str, Any],
     ranking_config: Mapping[str, Any],
 ) -> float:
     history = user_profile.get("history")
@@ -3048,17 +3089,6 @@ def _user_score(
     ) + _ranking_number(
         ranking_config, "user_score", "history_signal_weight"
     ) * signal * confidence
-    optional = task_profile.get("optional_constraints")
-    preference = user_profile.get("preference")
-    preference_map = preference if isinstance(preference, Mapping) else {}
-    if not isinstance(optional, Mapping) or not optional.get("format"):
-        preferred = preference_map.get("preferred_formats")
-        if isinstance(preferred, Sequence) and preferred:
-            score += _ranking_number(
-                ranking_config, "user_score", "preferred_format_bonus"
-            ) * _strength(
-                model, "capability_dist_prior", "format_following", ranking_config
-            )
     return _clamp(score)
 
 
@@ -3198,7 +3228,7 @@ def _base_score_row(
         model, task_profile, ranking_config, role="proposer"
     )
     user_score = (
-        _user_score(model, user_profile, task_profile, ranking_config)
+        _user_score(model, user_profile, ranking_config)
         if user_profile is not None
         else 0.0
     )
